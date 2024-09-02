@@ -28,6 +28,7 @@ if (cluster.isPrimary) {
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       client_offset TEXT UNIQUE,
+      room TEXT,
       content TEXT
     );
   `);
@@ -46,38 +47,69 @@ if (cluster.isPrimary) {
   });
 
   io.on("connection", async (socket) => {
-    socket.on("chat message", async (msg, clientOffset, callback) => {
-      let result;
-      try {
-        result = await db.run(
-          "INSERT INTO messages (content, client_offset) VALUES (?, ?)",
-          msg,
-          clientOffset
-        );
-      } catch (e) {
-        if (e.errno === 19 /* SQLITE_CONSTRAINT */) {
-          callback();
-        } else {
-          // nothing to do, just let the client retry
-        }
-        return;
-      }
-      io.emit("chat message", msg, result.lastID);
-      callback();
+    socket.on("join room", async (room) => {
+      socket.join(room);
+
+      // Retrieve the last 50 messages from the database for this room
+      const messages = await db.all(
+        "SELECT content FROM messages WHERE room = ? ORDER BY id DESC LIMIT 50",
+        room
+      );
+
+      // Send messages to the client in the correct order
+      socket.emit(
+        "room messages",
+        messages.reverse().map((row) => row.content)
+      );
     });
 
-    if (!socket.recovered) {
-      try {
-        await db.each(
-          "SELECT id, content FROM messages WHERE id > ?",
-          [socket.handshake.auth.serverOffset || 0],
-          (_err, row) => {
-            socket.emit("chat message", row.content, row.id);
+    socket.on("leave room", (room) => {
+      socket.leave(room);
+    });
+
+    socket.on(
+      "chat message",
+      async ({ room, message }, clientOffset, callback) => {
+        let result;
+        try {
+          result = await db.run(
+            "INSERT INTO messages (content, client_offset, room) VALUES (?, ?, ?)",
+            message,
+            clientOffset,
+            room
+          );
+        } catch (e) {
+          if (e.errno === 19 /* SQLITE_CONSTRAINT */) {
+            callback();
+          } else {
+            // nothing to do, just let the client retry
           }
-        );
-      } catch (e) {
-        // something went wrong
+          return;
+        }
+
+        // Emit the message only to the room it belongs to
+        io.to(room).emit("chat message", message, result.lastID);
+        callback();
       }
+    );
+
+    if (!socket.recovered) {
+      socket.on("disconnect", async () => {
+        const roomName = Array.from(socket.rooms)[1]; // Get the first room the socket is part of
+        if (roomName) {
+          try {
+            await db.each(
+              "SELECT id, content FROM messages WHERE id > ? AND room = ?",
+              [socket.handshake.auth.serverOffset || 0, roomName],
+              (_err, row) => {
+                socket.emit("chat message", row.content, row.id);
+              }
+            );
+          } catch (e) {
+            // Handle the error if necessary
+          }
+        }
+      });
     }
   });
 
